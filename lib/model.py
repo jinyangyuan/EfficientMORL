@@ -15,6 +15,8 @@ def cfg():
     input_size = [3,64,64] # [C, H, W]
     z_size = 64
     K = 4
+    K_test = 4
+    K_general = 4
     stochastic_layers = 3  # L
     refinement_iters = 3  # I
     log_scale = math.log(0.1)  # log base e
@@ -28,9 +30,11 @@ def cfg():
 
 class SlotAttention(nn.Module):
     @net.capture
-    def __init__(self, K, z_size, input_size, batch_size):
+    def __init__(self, K, K_test, K_general, z_size, input_size, batch_size):
         super(SlotAttention, self).__init__()
         self.K = K
+        self.K_test = K_test
+        self.K_general = K_general
         self.z_size = z_size
         self.scale = z_size ** -0.5
         self.eps = 1e-8
@@ -187,7 +191,7 @@ class ImageDecoder(nn.Module):
                 nn.ConvTranspose2d(64, output_size, 3, 1, 1, output_padding=0)
             )
             self.z_grid_shape = (small_grid_size, small_grid_size)
-            self.positional_embedding = SlotAttention.create_positional_embedding(small_grid_size, small_grid_size, K * batch_size)
+            self.positional_embedding = SlotAttention.create_positional_embedding(small_grid_size, small_grid_size, 1)
         elif image_decoder == 'iodine':
             self.decode = nn.Sequential(
                 nn.Conv2d(z_size, 64, 3, 1),
@@ -202,7 +206,7 @@ class ImageDecoder(nn.Module):
             )
             self.z_grid_shape = (self.h + 10, self.w + 10)
             self.positional_embedding = SlotAttention.create_positional_embedding(
-                    self.z_grid_shape[0], self.z_grid_shape[1], K * batch_size)
+                    self.z_grid_shape[0], self.z_grid_shape[1], 1)
 
         elif image_decoder == 'small':
             self.decode = nn.Sequential(
@@ -216,7 +220,7 @@ class ImageDecoder(nn.Module):
             )
             self.z_grid_shape = (self.h + 6, self.w + 6)
             self.positional_embedding = SlotAttention.create_positional_embedding(
-                    self.z_grid_shape[0], self.z_grid_shape[1], K * batch_size)
+                    self.z_grid_shape[0], self.z_grid_shape[1], 1)
         self.pos_embed_projection = nn.Linear(4, z_size)
 
 
@@ -226,7 +230,7 @@ class ImageDecoder(nn.Module):
         # Expand spatially: (n, z_dim) -> (n, z_dim, h, w)
         z_b = z.view((n, -1, 1, 1)).expand(-1, -1, self.z_grid_shape[0], self.z_grid_shape[1])
         
-        pos_embed = self.positional_embedding.to(z.device)  # [N,H,W,4]
+        pos_embed = self.positional_embedding.to(z.device).expand(n, -1, -1, -1)  # [N,H,W,4]
         pos_embed = self.pos_embed_projection(pos_embed)  # [N,H,W,64]
         pos_embed = pos_embed.permute(0,3,1,2).contiguous()
 
@@ -237,10 +241,12 @@ class ImageDecoder(nn.Module):
 
 class IndependentPrior(nn.Module):
     @net.capture
-    def __init__(self, z_size, K):
+    def __init__(self, z_size, K, K_test, K_general):
         super(IndependentPrior, self).__init__()
         self.z_size = z_size
         self.K = K
+        self.K_test = K_test
+        self.K_general = K_general
         self.z_linear = nn.Sequential(
             nn.Linear(self.z_size, 128),
             nn.ELU(True))
@@ -314,9 +320,11 @@ class RefinementNetwork(nn.Module):
 
 class HVAENetworks(nn.Module):
     @net.capture
-    def __init__(self, K, z_size, input_size, stochastic_layers, use_DualGRU, batch_size):
+    def __init__(self, K, K_test, K_general, z_size, input_size, stochastic_layers, use_DualGRU, batch_size):
         super(HVAENetworks, self).__init__()
         self.K = K
+        self.K_test = K_test
+        self.K_general = K_general
         self.z_size = z_size
         self.batch_size = batch_size
         self.num_stochastic_layers = stochastic_layers
@@ -327,7 +335,7 @@ class HVAENetworks(nn.Module):
 
         h = input_size[1]
         w = input_size[2]
-        self.positional_embedding = SlotAttention.create_positional_embedding(h,w, batch_size)
+        self.positional_embedding = SlotAttention.create_positional_embedding(h, w, 1)
         self.pos_embed_projection = nn.Linear(4, 64)
         self.encoder_pt_1 = nn.Sequential(
             nn.Conv2d(3, 64, 5, 1, 2),
@@ -388,7 +396,7 @@ class HVAENetworks(nn.Module):
 
     def forward(self, x, debug):
 
-        pos_embed = self.positional_embedding.to(x.device)
+        pos_embed = self.positional_embedding.to(x.device).expand(x.shape[0], -1, -1, -1)
         x = self.encoder_pt_1(x)
         x = x.permute(0,2,3,1).contiguous()  # [N,H,W,64]
         pos_embed = self.pos_embed_projection(pos_embed)
@@ -399,7 +407,7 @@ class HVAENetworks(nn.Module):
         x_locs, masks, posteriors = [], [], []
         all_samples = {}
 
-        lamda = self.init_posterior.repeat(self.batch_size * self.K, 1)  # [N*K,2*z_size]
+        lamda = self.init_posterior.repeat(x.shape[0] * self.K, 1)  # [N*K,2*z_size]
         # For L = 0 case...
         loc, sp = lamda.chunk(2, dim=1)
         loc = loc.contiguous()
@@ -423,7 +431,7 @@ class HVAENetworks(nn.Module):
             dots = torch.einsum('bid,bjd->bij', q, k)
             # dots is [N, K, HW]
             attn = dots.softmax(dim=1) + self.eps
-            all_samples[f'attn_{layer}'] = attn.view(self.batch_size, self.K, 1, self.H, self.W).detach()
+            all_samples[f'attn_{layer}'] = attn.view(x.shape[0], self.K, 1, self.H, self.W).detach()
             attn = attn / attn.sum(dim=-1, keepdim=True)
 
             updates = torch.einsum('bjd,bij->bid', v, attn)
@@ -485,11 +493,13 @@ class HVAENetworks(nn.Module):
 
 class EfficientMORL(nn.Module):
     @net.capture
-    def __init__(self, K, z_size, input_size, batch_size, stochastic_layers,
+    def __init__(self, K, K_test, K_general, z_size, input_size, batch_size, stochastic_layers,
                  log_scale, image_likelihood, geco_warm_start, refinement_iters,
                  bottom_up_prior, reverse_prior_plusplus, use_geco=False):
         super(EfficientMORL, self).__init__()
         self.K = K
+        self.K_test = K_test
+        self.K_general = K_general
         self.input_size = input_size
         self.stochastic_layers = stochastic_layers
         self.image_likelihood = image_likelihood
@@ -537,7 +547,7 @@ class EfficientMORL(nn.Module):
         all_auxiliary = {**all_auxiliary, **auxiliary_outs}
         
         if self.refinement_iters > 0:
-            h = self.h_0.to(x.device)
+            h = torch.zeros(1, x.shape[0] * self.K, self.z_size).to(x.device)
 
         for refinement_iter in range(self.refinement_iters+1):
             
@@ -575,7 +585,7 @@ class EfficientMORL(nn.Module):
             # Hierarchical prior computation
             if refinement_iter == 0:
                 # top-down kl
-                kl_div = torch.zeros(self.batch_size).to(x.device)
+                kl_div = torch.zeros(x.shape[0]).to(x.device)
                 
                 # If using the reversed prior
                 if not self.bottom_up_prior:
@@ -583,43 +593,43 @@ class EfficientMORL(nn.Module):
                     for layer in list(range(self.stochastic_layers))[::-1]:
                         # top layer is standard Gaussian
                         if layer == self.stochastic_layers-1:
-                            prior_z = std_mvn(shape=[self.batch_size * self.K, self.z_size], device=x.device)
+                            prior_z = std_mvn(shape=[x.shape[0] * self.K, self.z_size], device=x.device)
                         else:
                             # z^l+1 ~ q(z^{l+1} | z^l, x)
                             z = posteriors[layer+1].rsample()
                             loc_z, sp_z = self.hvae_networks.indep_prior(z.view(-1, self.K, self.z_size))
-                            loc_z = loc_z.view(self.batch_size * self.K, -1)
-                            sp_z = sp_z.view(self.batch_size * self.K, -1)
+                            loc_z = loc_z.view(x.shape[0] * self.K, -1)
+                            sp_z = sp_z.view(x.shape[0] * self.K, -1)
                             # p(z^l | z^l+1)
                             prior_z = mvn(loc_z, sp_z)
                             
                         kl = torch.distributions.kl.kl_divergence(posteriors[layer], prior_z)
-                        kl= kl.view(self.batch_size, self.K).sum(1)
+                        kl= kl.view(x.shape[0], self.K).sum(1)
                         kl_div += kl
                 else:
                     for layer in range(self.stochastic_layers):
                         if layer == 0:
-                            prior_z = std_mvn(shape=[self.batch_size * self.K, self.z_size], device=x.device)
+                            prior_z = std_mvn(shape=[x.shape[0] * self.K, self.z_size], device=x.device)
                         else:
                             z = posteriors[layer-1].rsample()
                             loc_z, sp_z = self.hvae_networks.indep_prior(z.view(-1, self.K, self.z_size))
-                            loc_z = loc_z.view(self.batch_size * self.K, -1)
-                            sp_z = sp_z.view(self.batch_size * self.K, -1)
+                            loc_z = loc_z.view(x.shape[0] * self.K, -1)
+                            sp_z = sp_z.view(x.shape[0] * self.K, -1)
                             prior_z = mvn(loc_z, sp_z)
 
                         kl = torch.distributions.kl.kl_divergence(posteriors[layer], prior_z)
-                        kl = kl.view(self.batch_size, self.K).sum(1)
+                        kl = kl.view(x.shape[0], self.K).sum(1)
                         kl_div += kl
 
             # Refinement step KL
             else:
                 if not self.reverse_prior_plusplus or self.stochastic_layers == 0:
-                    prior_z = std_mvn(shape=[self.batch_size * self.K, self.z_size], device=x.device)
+                    prior_z = std_mvn(shape=[x.shape[0] * self.K, self.z_size], device=x.device)
                 # else, prior_z = p(z^1 | z^2) when self.reverse_prior_plusplus is True
 
                 # posterior is q(z; \lambda^{(L,i)})
                 kl = torch.distributions.kl.kl_divergence(posterior, prior_z)
-                kl = kl.view(self.batch_size, self.K).sum(1)
+                kl = kl.view(x.shape[0], self.K).sum(1)
                 kl_div = kl
 
             final_kl = torch.mean(kl_div)
@@ -643,6 +653,9 @@ class EfficientMORL(nn.Module):
                 return posteriors[-1]
             else:
                 return posterior
+
+        all_auxiliary['means_final'] = x_loc
+        all_auxiliary['masks_final'] = mask_logprobs
     
         return all_auxiliary, total_loss, final_nll, final_kl, deltas
 
